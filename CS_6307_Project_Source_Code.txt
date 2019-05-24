@@ -1,0 +1,92 @@
+import org. apache. spark. {SparkConf,  SparkContext}
+import org. apache. spark. sql. SQLContext
+import scala. math. floor
+import org. apache. spark. sql. functions. expr
+import org. apache. spark. sql. functions. _
+import org. apache. spark. ml. Pipeline
+import org. apache. spark. ml. feature. {OneHotEncoderEstimator,  StringIndexer}
+import org. apache. spark. ml. feature. VectorAssembler
+import org. apache. spark. ml. regression. LinearRegression
+import org. apache. spark. ml. regression. {RandomForestRegressionModel,  RandomForestRegressor}
+
+object CS_6307_Project {
+
+  def main(args : Array[String]): Unit = {
+    var conf = new SparkConf(). setAppName("CS_6307_Project")
+    val sc = new SparkContext(conf)
+    val sqlContext = new SQLContext(sc)
+    import sqlContext. implicits. _
+
+    val flightsDF = sqlContext. read. format("csv"). option("header",  "true"). load(args(0))
+
+    val depConv = "(CRS_DEP_TIME % 100) + floor(CRS_DEP_TIME/100)*60"
+    val arrConv = "(CRS_ARR_TIME % 100) + floor(CRS_ARR_TIME/100)*60"
+
+    val flightsConv = flightsDF. withColumn("CRS_DEP_MIN", expr(depConv)). drop("CRS_DEP_TIME")
+      . withColumn("CRS_ARR_MIN", expr(arrConv)). drop("CRS_ARR_TIME"). drop("_c0")
+      . filter("YEAR <= 2016")
+
+    val toInt    = udf[Int,  String]( _. toInt)
+    val toDouble = udf[Double,  String]( _. toDouble)
+
+    val rawFeats2 = flightsConv
+      . withColumn("year", toInt(flightsConv("YEAR")))
+      . withColumn("month", toInt(flightsConv("MONTH")))
+      . withColumn("dom", toInt(flightsConv("DAY_OF_MONTH")))
+      . withColumn("dow", toInt(flightsConv("DAY_OF_WEEK")))
+      . withColumnRenamed("OP_UNIQUE_CARRIER", "carrier")
+      . withColumnRenamed("ORIGIN", "origin")
+      . withColumnRenamed("DEST", "dest")
+      . drop("DAY_OF_MONTH"). drop("DAY_OF_WEEK")
+
+    val indexer1 = new StringIndexer(). setInputCol("carrier"). setOutputCol("carrierIndex")
+    val indexer2 = new StringIndexer(). setInputCol("origin"). setOutputCol("originIndex")
+    val indexer3 = new StringIndexer(). setInputCol("dest"). setOutputCol("destIndex")
+    val encoder = new OneHotEncoderEstimator()
+      . setInputCols(Array("year", "month", "dom", "dow", indexer1. getOutputCol, indexer2. getOutputCol, indexer3. getOutputCol))
+      . setOutputCols(Array("yearVec", "monthVec", "domVec", "dowVec", "carrierVec", "originVec", "destVec"))
+
+    val pipeline = new Pipeline(). setStages(Array(indexer1, indexer2, indexer3, encoder))
+
+    val Feats = pipeline. fit(rawFeats2). transform(rawFeats2). select("year", "yearVec", "monthVec", "domVec", 
+      "dowVec", "carrierVec", "originVec", "destVec", "CRS_DEP_MIN", "CRS_ARR_MIN", "ARR_DELAY")
+
+    val assembler = new VectorAssembler(). setInputCols(Array("yearVec", "monthVec", "domVec", "dowVec", "carrierVec", 
+      "originVec", "destVec", "CRS_DEP_MIN", "CRS_ARR_MIN")). setOutputCol("features")
+    val finalDF = assembler. transform(Feats). withColumnRenamed("ARR_DELAY", "LABEL")
+      . select("year", "features", "LABEL")
+
+    val trainingData = finalDF. withColumn("label", toDouble(finalDF("LABEL")))
+      . filter("year != 2016"). drop("year")
+    val testData = finalDF. withColumn("label", toDouble(finalDF("LABEL")))
+      . filter("year == 2016"). drop("year")
+
+    val lr = new LinearRegression()
+
+    val lrModel = lr. fit(trainingData)
+
+    val lrPredict = lrModel. transform(testData)
+
+    val mseComp = "(label-prediction)*(label-prediction)"
+    val lrMSE = lrPredict. withColumn("SE", expr(mseComp)). select("SE"). rdd
+      . map(x => x. get(0). toString. toFloat). sum/(lrPredict. count())
+
+    val constMSE = lrPredict. select("label"). rdd
+      . map(x => x. get(0). toString. toFloat*x. get(0). toString. toFloat). sum/(lrPredict. count())
+
+    val rf = new RandomForestRegressor(). setNumTrees(10) // Presumably,  more trees could be run,  but it is time prohibitive
+      . setLabelCol("label")
+      . setFeaturesCol("features")
+
+    val rfModel = rf. fit(trainingData)
+    val rfPredict = rfModel. transform(testData. drop("year"))
+    val rfMSE = rfPredict. withColumn("SE", expr(mseComp)). select("SE"). rdd
+      . map(x => x. get(0). toString. toFloat). sum/(rfPredict. count())
+
+    sc. parallelize(Array(("Constant Test MSE", constMSE), ("Linear Regression Test MSE", lrMSE), 
+      ("Random Forest Test MSE", rfMSE))). saveAsTextFile(args(1))
+
+
+  }
+
+}
